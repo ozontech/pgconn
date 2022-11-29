@@ -1,7 +1,20 @@
-[![](https://godoc.org/github.com/jackc/pgconn?status.svg)](https://godoc.org/github.com/jackc/pgconn)
-![CI](https://github.com/jackc/pgconn/workflows/CI/badge.svg)
+
+### forked from https://github.com/jackc/pgconn
 
 # pgconn
+
+## Patch
+
+Added `Cleanup` method to `PgConn`. This method cleans connection
+by reading all data that was in socket before this method was called, calls
+rollback if connection was in transaction state and resets connection session.
+
+Status `connStatusNeedCleanup` added to connection statuses. If error
+for which reason `asyncClose` was called was context cancellation error
+`connStatusNeedCleanup` is set to connection status. Then user can call `NeedsCleanup()`
+method and decide if he wants to clean up connection or close it.
+
+## Description
 
 Package pgconn is a low-level PostgreSQL database driver. It operates at nearly the same level as the C library libpq.
 It is primarily intended to serve as the foundation for higher level libraries such as https://github.com/jackc/pgx.

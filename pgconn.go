@@ -27,9 +27,12 @@ const (
 	connStatusClosed
 	connStatusIdle
 	connStatusBusy
+	connStatusNeedCleanup
 )
 
 const wbufLen = 1024
+
+const CleanupDefaultTimeout = time.Millisecond * 100
 
 // Notice represents a notice response message reported by the PostgreSQL server. Be aware that this is distinct from
 // LISTEN/NOTIFY notification.
@@ -80,7 +83,8 @@ type PgConn struct {
 
 	config *Config
 
-	status byte // One of connStatus* constants
+	cleanupWithoutReset bool
+	status              byte // One of connStatus* constants
 
 	bufferingReceive    bool
 	bufferingReceiveMux sync.Mutex
@@ -435,7 +439,7 @@ func (pgConn *PgConn) SendBytes(ctx context.Context, buf []byte) error {
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		return &writeError{err: err, safeToRetry: n == 0}
 	}
 
@@ -504,7 +508,7 @@ func (pgConn *PgConn) peekMessage() (pgproto3.BackendMessage, error) {
 		var netErr net.Error
 		isNetErr := errors.As(err, &netErr)
 		if !(isNetErr && netErr.Timeout()) {
-			pgConn.asyncClose()
+			pgConn.asyncClose(err)
 		}
 
 		return nil, err
@@ -522,7 +526,7 @@ func (pgConn *PgConn) receiveMessage() (pgproto3.BackendMessage, error) {
 		var netErr net.Error
 		isNetErr := errors.As(err, &netErr)
 		if !(isNetErr && netErr.Timeout()) {
-			pgConn.asyncClose()
+			pgConn.asyncClose(err)
 		}
 
 		return nil, err
@@ -567,9 +571,10 @@ func (pgConn *PgConn) PID() uint32 {
 // TxStatus returns the current TxStatus as reported by the server in the ReadyForQuery message.
 //
 // Possible return values:
-//   'I' - idle / not in transaction
-//   'T' - in a transaction
-//   'E' - in a failed transaction
+//
+//	'I' - idle / not in transaction
+//	'T' - in a transaction
+//	'E' - in a failed transaction
 //
 // See https://www.postgresql.org/docs/current/protocol-message-formats.html.
 func (pgConn *PgConn) TxStatus() byte {
@@ -591,7 +596,6 @@ func (pgConn *PgConn) Close(ctx context.Context) error {
 	pgConn.status = connStatusClosed
 
 	defer close(pgConn.cleanupDone)
-	defer pgConn.conn.Close()
 
 	if ctx != context.Background() {
 		// Close may be called while a cancellable query is in progress. This will most often be triggered by panic when
@@ -610,33 +614,155 @@ func (pgConn *PgConn) Close(ctx context.Context) error {
 	// ignores errors.
 	//
 	// See https://github.com/jackc/pgx/issues/637
-	pgConn.conn.Write([]byte{'X', 0, 0, 0, 4})
+
+	if tcpConn, ok := pgConn.conn.(*net.TCPConn); ok {
+		tcpConn.SetLinger(0)
+	}
 
 	return pgConn.conn.Close()
 }
 
+func (pgConn *PgConn) execRoundTrip(ctx context.Context, sql string) error {
+	rr := pgConn.Exec(ctx, sql)
+	if rr.err != nil {
+		return fmt.Errorf("exec: %w", rr.err)
+	}
+
+	// reading all that is left in socket
+	if err := rr.Close(); err != nil {
+		return fmt.Errorf("close: %w", err)
+	}
+
+	return nil
+}
+
+func (pgConn *PgConn) Reset() error {
+	for {
+		msg, err := pgConn.receiveMessage()
+		if err != nil {
+			return fmt.Errorf("receive message: %w", err)
+		}
+
+		// every request is ended with ReadyForQuery message
+		// so we just read till it comes or error occurs
+		switch msg := msg.(type) {
+		case *pgproto3.ErrorResponse:
+			return ErrorResponseToPgError(msg)
+		case *pgproto3.ReadyForQuery:
+			return nil
+		}
+	}
+}
+
+func (pgConn *PgConn) cleanSocket() error {
+	// If this option is set, then there is nothing
+	// to read from the socket and there is no need
+	// to hang forever on reading.
+	if pgConn.cleanupWithoutReset {
+		return nil
+	}
+
+	// Read all the data left from the previous request.
+	if err := pgConn.Reset(); err != nil {
+		return fmt.Errorf("reset: %w", err)
+	}
+
+	return nil
+}
+
+// Acts as 'DISCARD ALL;' except for 'DEALLOCATE ALL;'.
+// Prepared statements don't get deallocated.
+// https://postgrespro.ru/docs/postgrespro/14/sql-discard
+const sessionResetQuery = `
+SET SESSION AUTHORIZATION DEFAULT;
+RESET ALL;
+CLOSE ALL;
+UNLISTEN *;
+SELECT pg_advisory_unlock_all();
+DISCARD PLANS;
+DISCARD SEQUENCES; 
+DISCARD TEMP;`
+
+func (pgConn *PgConn) Cleanup(ctx context.Context) error {
+	// Default timeout for attempt to recover
+	deadline, ok := ctx.Deadline()
+
+	if !ok {
+		deadline = time.Now().Add(CleanupDefaultTimeout)
+		deadlineCtx, cancel := context.WithDeadline(ctx, deadline)
+		ctx = deadlineCtx
+		defer cancel()
+	}
+
+	pgConn.conn.SetDeadline(deadline)
+	if err := pgConn.cleanSocket(); err != nil {
+		return fmt.Errorf("clean socket: %w", err)
+	}
+
+	// Switch status to idle to not receive an error
+	// while locking connection on exec operation.
+	pgConn.status = connStatusIdle
+
+	// Rollback if there is an active transaction,
+	// Checking TxStatus to prevent overhead
+	if pgConn.TxStatus() != 'I' {
+		if err := pgConn.execRoundTrip(ctx, "ROLLBACK;"); err != nil {
+			return fmt.Errorf("rollback: %w", err)
+		}
+	}
+
+	// Full session reset
+	if err := pgConn.execRoundTrip(ctx, sessionResetQuery); err != nil {
+		return fmt.Errorf("discard all: %w", err)
+	}
+
+	// Reset everything.
+	// Some may be redundant but are left just in case something goes wrong.
+	pgConn.conn.SetDeadline(time.Time{})
+	pgConn.status = connStatusIdle
+	pgConn.cleanupWithoutReset = false
+	pgConn.contextWatcher.Unwatch()
+
+	return nil
+}
+
+// SetCleanupWithoutReset marks connection socket to be cleaned up but there
+// is no need to await and read any response from the server.
+func (pgConn *PgConn) SetCleanupWithoutReset(cleanupWithoutReading bool) {
+	pgConn.cleanupWithoutReset = cleanupWithoutReading
+}
+
+// SetNeedsCleanup marks connection as requiring a cleanup.
+func (pgConn *PgConn) SetNeedsCleanup() {
+	pgConn.status = connStatusNeedCleanup
+}
+
 // asyncClose marks the connection as closed and asynchronously sends a cancel query message and closes the underlying
 // connection.
-func (pgConn *PgConn) asyncClose() {
+func (pgConn *PgConn) asyncClose(reason error) {
 	if pgConn.status == connStatusClosed {
 		return
 	}
+	// Set a connStatusNeedCleanup status to reset connection later.
+	if pgConn.status == connStatusBusy {
+		var netErr net.Error
+		if isNetErr := errors.As(reason, &netErr); isNetErr && netErr.Timeout() {
+			pgConn.status = connStatusNeedCleanup
+			return
+		}
+	}
+
 	pgConn.status = connStatusClosed
 
 	go func() {
 		defer close(pgConn.cleanupDone)
 		defer pgConn.conn.Close()
 
-		deadline := time.Now().Add(time.Second * 15)
-
-		ctx, cancel := context.WithDeadline(context.Background(), deadline)
-		defer cancel()
-
-		pgConn.CancelRequest(ctx)
-
-		pgConn.conn.SetDeadline(deadline)
-
-		pgConn.conn.Write([]byte{'X', 0, 0, 0, 4})
+		if tcpConn, ok := pgConn.conn.(*net.TCPConn); ok {
+			// Forcefully close TCP connection
+			// The operating system discards any unsent or unacknowledged data.
+			tcpConn.SetLinger(0)
+		}
 	}()
 }
 
@@ -664,6 +790,14 @@ func (pgConn *PgConn) IsBusy() bool {
 	return pgConn.status == connStatusBusy
 }
 
+func (pgConn *PgConn) IsIdle() bool {
+	return pgConn.status == connStatusIdle
+}
+
+func (pgConn *PgConn) NeedsCleanup() bool {
+	return pgConn.status == connStatusNeedCleanup
+}
+
 // lock locks the connection.
 func (pgConn *PgConn) lock() error {
 	switch pgConn.status {
@@ -673,6 +807,8 @@ func (pgConn *PgConn) lock() error {
 		return &connLockError{status: "conn closed"}
 	case connStatusUninitialized:
 		return &connLockError{status: "conn uninitialized"}
+	case connStatusNeedCleanup:
+		return ErrLockCleanupConn
 	}
 	pgConn.status = connStatusBusy
 	return nil
@@ -683,6 +819,7 @@ func (pgConn *PgConn) unlock() {
 	case connStatusBusy:
 		pgConn.status = connStatusIdle
 	case connStatusClosed:
+	case connStatusNeedCleanup:
 	default:
 		panic("BUG: cannot unlock unlocked connection") // This should only be possible if there is a bug in this package.
 	}
@@ -802,7 +939,7 @@ func (pgConn *PgConn) Prepare(ctx context.Context, name, sql string, paramOIDs [
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		return nil, &writeError{err: err, safeToRetry: n == 0}
 	}
 
@@ -814,7 +951,7 @@ readloop:
 	for {
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
-			pgConn.asyncClose()
+			pgConn.asyncClose(err)
 			return nil, preferContextOverNetTimeoutError(ctx, err)
 		}
 
@@ -974,7 +1111,7 @@ func (pgConn *PgConn) Exec(ctx context.Context, sql string) *MultiResultReader {
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		pgConn.contextWatcher.Unwatch()
 		multiResult.closed = true
 		multiResult.err = &writeError{err: err, safeToRetry: n == 0}
@@ -1120,7 +1257,7 @@ func (pgConn *PgConn) execExtendedSuffix(buf []byte, result *ResultReader) {
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		result.concludeCommand(nil, &writeError{err: err, safeToRetry: n == 0})
 		pgConn.contextWatcher.Unwatch()
 		result.closed = true
@@ -1154,7 +1291,7 @@ func (pgConn *PgConn) CopyTo(ctx context.Context, w io.Writer, sql string) (Comm
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		pgConn.unlock()
 		return nil, &writeError{err: err, safeToRetry: n == 0}
 	}
@@ -1165,7 +1302,7 @@ func (pgConn *PgConn) CopyTo(ctx context.Context, w io.Writer, sql string) (Comm
 	for {
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
-			pgConn.asyncClose()
+			pgConn.asyncClose(err)
 			return nil, preferContextOverNetTimeoutError(ctx, err)
 		}
 
@@ -1174,7 +1311,7 @@ func (pgConn *PgConn) CopyTo(ctx context.Context, w io.Writer, sql string) (Comm
 		case *pgproto3.CopyData:
 			_, err := w.Write(msg.Data)
 			if err != nil {
-				pgConn.asyncClose()
+				pgConn.asyncClose(err)
 				return nil, err
 			}
 		case *pgproto3.ReadyForQuery:
@@ -1214,7 +1351,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 
 	n, err := pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		return nil, &writeError{err: err, safeToRetry: n == 0}
 	}
 
@@ -1237,7 +1374,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 				_, writeErr := pgConn.conn.Write(buf)
 				if writeErr != nil {
 					// Write errors are always fatal, but we can't use asyncClose because we are in a different goroutine.
-					pgConn.conn.Close()
+					pgConn.Close(context.Background())
 
 					copyErrChan <- writeErr
 					return
@@ -1264,7 +1401,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 		case <-signalMessageChan:
 			msg, err := pgConn.receiveMessage()
 			if err != nil {
-				pgConn.asyncClose()
+				pgConn.asyncClose(err)
 				return nil, preferContextOverNetTimeoutError(ctx, err)
 			}
 
@@ -1288,7 +1425,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 	}
 	_, err = pgConn.conn.Write(buf)
 	if err != nil {
-		pgConn.asyncClose()
+		pgConn.asyncClose(err)
 		return nil, err
 	}
 
@@ -1297,7 +1434,7 @@ func (pgConn *PgConn) CopyFrom(ctx context.Context, r io.Reader, sql string) (Co
 	for {
 		msg, err := pgConn.receiveMessage()
 		if err != nil {
-			pgConn.asyncClose()
+			pgConn.asyncClose(err)
 			return nil, preferContextOverNetTimeoutError(ctx, err)
 		}
 
@@ -1323,6 +1460,11 @@ type MultiResultReader struct {
 	err    error
 }
 
+func (mrr *MultiResultReader) Reset() {
+	mrr.err = nil
+	mrr.closed = false
+}
+
 // ReadAll reads all available results. Calling ReadAll is mutually exclusive with all other MultiResultReader methods.
 func (mrr *MultiResultReader) ReadAll() ([]*Result, error) {
 	var results []*Result
@@ -1342,7 +1484,7 @@ func (mrr *MultiResultReader) receiveMessage() (pgproto3.BackendMessage, error) 
 		mrr.pgConn.contextWatcher.Unwatch()
 		mrr.err = preferContextOverNetTimeoutError(mrr.ctx, err)
 		mrr.closed = true
-		mrr.pgConn.asyncClose()
+		mrr.pgConn.asyncClose(err)
 		return nil, mrr.err
 	}
 
@@ -1552,7 +1694,7 @@ func (rr *ResultReader) receiveMessage() (msg pgproto3.BackendMessage, err error
 		rr.pgConn.contextWatcher.Unwatch()
 		rr.closed = true
 		if rr.multiResultReader == nil {
-			rr.pgConn.asyncClose()
+			rr.pgConn.asyncClose(err)
 		}
 
 		return nil, rr.err

@@ -1,3 +1,4 @@
 .envrc
 vendor/
 .vscode
+.idea

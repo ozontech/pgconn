@@ -96,6 +96,17 @@ func (c *LRU) Clear(ctx context.Context) error {
 	return nil
 }
 
+// Clean simply deletes all elements from map and list without
+// deallocating statement
+func (c *LRU) Clean() {
+	for c.l.Len() > 0 {
+		oldest := c.l.Back()
+		c.l.Remove(oldest)
+		psd := oldest.Value.(*pgconn.StatementDescription)
+		delete(c.m, psd.SQL)
+	}
+}
+
 func (c *LRU) StatementErrored(sql string, err error) {
 	pgErr, ok := err.(*pgconn.PgError)
 	if !ok {

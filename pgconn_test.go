@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"math"
 	"net"
 	"os"
@@ -698,12 +697,7 @@ func TestConnExecContextCanceled(t *testing.T) {
 	err = multiResult.Close()
 	assert.True(t, pgconn.Timeout(err))
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
-	assert.True(t, pgConn.IsClosed())
-	select {
-	case <-pgConn.CleanupDone():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connection cleanup exceeded maximum time")
-	}
+	assert.True(t, pgConn.NeedsCleanup())
 }
 
 func TestConnExecContextPrecanceled(t *testing.T) {
@@ -843,13 +837,7 @@ func TestConnExecParamsCanceled(t *testing.T) {
 	assert.Equal(t, pgconn.CommandTag(nil), commandTag)
 	assert.True(t, pgconn.Timeout(err))
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
-
-	assert.True(t, pgConn.IsClosed())
-	select {
-	case <-pgConn.CleanupDone():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connection cleanup exceeded maximum time")
-	}
+	assert.True(t, pgConn.NeedsCleanup())
 }
 
 func TestConnExecParamsPrecanceled(t *testing.T) {
@@ -1027,12 +1015,7 @@ func TestConnExecPreparedCanceled(t *testing.T) {
 	commandTag, err := result.Close()
 	assert.Equal(t, pgconn.CommandTag(nil), commandTag)
 	assert.True(t, pgconn.Timeout(err))
-	assert.True(t, pgConn.IsClosed())
-	select {
-	case <-pgConn.CleanupDone():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connection cleanup exceeded maximum time")
-	}
+	assert.True(t, pgConn.NeedsCleanup())
 }
 
 func TestConnExecPreparedPrecanceled(t *testing.T) {
@@ -1548,12 +1531,7 @@ func TestConnCopyToCanceled(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, pgconn.CommandTag(nil), res)
 
-	assert.True(t, pgConn.IsClosed())
-	select {
-	case <-pgConn.CleanupDone():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connection cleanup exceeded maximum time")
-	}
+	assert.True(t, pgConn.NeedsCleanup())
 }
 
 func TestConnCopyToPrecanceled(t *testing.T) {
@@ -1614,50 +1592,6 @@ func TestConnCopyFrom(t *testing.T) {
 	assert.Equal(t, inputRows, result.Rows)
 
 	ensureConnValid(t, pgConn)
-}
-
-func TestConnCopyFromCanceled(t *testing.T) {
-	t.Parallel()
-
-	pgConn, err := pgconn.Connect(context.Background(), os.Getenv("PGX_TEST_CONN_STRING"))
-	require.NoError(t, err)
-	defer closeConn(t, pgConn)
-
-	if pgConn.ParameterStatus("crdb_version") != "" {
-		t.Skip("Server does not support query cancellation (https://github.com/cockroachdb/cockroach/issues/41335)")
-	}
-
-	_, err = pgConn.Exec(context.Background(), `create temporary table foo(
-		a int4,
-		b varchar
-	)`).ReadAll()
-	require.NoError(t, err)
-
-	r, w := io.Pipe()
-	go func() {
-		for i := 0; i < 1000000; i++ {
-			a := strconv.Itoa(i)
-			b := "foo " + a + " bar"
-			_, err := w.Write([]byte(fmt.Sprintf("%s,\"%s\"\n", a, b)))
-			if err != nil {
-				return
-			}
-			time.Sleep(time.Microsecond)
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	ct, err := pgConn.CopyFrom(ctx, r, "COPY foo FROM STDIN WITH (FORMAT csv)")
-	cancel()
-	assert.Equal(t, int64(0), ct.RowsAffected())
-	assert.Error(t, err)
-
-	assert.True(t, pgConn.IsClosed())
-	select {
-	case <-pgConn.CleanupDone():
-	case <-time.After(5 * time.Second):
-		t.Fatal("Connection cleanup exceeded maximum time")
-	}
 }
 
 func TestConnCopyFromPrecanceled(t *testing.T) {
@@ -1903,6 +1837,7 @@ func TestConnCancelRequest(t *testing.T) {
 
 // https://github.com/jackc/pgx/issues/659
 func TestConnContextCanceledCancelsRunningQueryOnServer(t *testing.T) {
+	t.Skipf("Skipped due to disabled cancel request")
 	t.Parallel()
 
 	pgConn, err := pgconn.Connect(context.Background(), os.Getenv("PGX_TEST_CONN_STRING"))
@@ -2104,26 +2039,127 @@ func TestFatalErrorReceivedAfterCommandComplete(t *testing.T) {
 	require.Error(t, err)
 }
 
-func Example() {
+func TestCleanup(t *testing.T) {
+	t.Parallel()
+
 	pgConn, err := pgconn.Connect(context.Background(), os.Getenv("PGX_TEST_CONN_STRING"))
-	if err != nil {
-		log.Fatalln(err)
-	}
-	defer pgConn.Close(context.Background())
+	require.NoError(t, err)
 
-	result := pgConn.ExecParams(context.Background(), "select generate_series(1,3)", nil, nil, nil, nil).Read()
-	if result.Err != nil {
-		log.Fatalln(result.Err)
+	defer closeConn(t, pgConn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	rr := pgConn.Exec(ctx, `select 'Hello, world', pg_sleep(0.05)`)
+	for rr.NextResult() {
+	}
+	err = rr.Close()
+	assert.True(t, pgconn.Timeout(err))
+	assert.True(t, pgConn.NeedsCleanup())
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond*100)
+	defer cancel()
+
+	err = pgConn.Cleanup(ctx)
+	require.NoError(t, err)
+
+	assert.True(t, pgConn.IsIdle())
+}
+
+func TestCleanupWithoutReadAll(t *testing.T) {
+	t.Parallel()
+
+	pgConn, err := pgconn.Connect(context.Background(), os.Getenv("PGX_TEST_CONN_STRING"))
+	require.NoError(t, err)
+
+	defer closeConn(t, pgConn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rr := pgConn.Exec(ctx, `select 'Hello, world'`)
+	for rr.NextResult() {
+	}
+	err = rr.Close()
+	assert.True(t, pgconn.Timeout(err))
+	pgConn.SetCleanupWithoutReset(true)
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond*100)
+	defer cancel()
+
+	err = pgConn.Cleanup(ctx)
+	require.NoError(t, err)
+
+	require.True(t, pgConn.IsIdle())
+}
+
+func TestCleanupWithTransaction(t *testing.T) {
+	t.Parallel()
+
+	pgConn, err := pgconn.Connect(context.Background(), os.Getenv("PGX_TEST_CONN_STRING"))
+	require.NoError(t, err)
+
+	defer closeConn(t, pgConn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rr := pgConn.Exec(ctx, "begin")
+	for rr.NextResult() {
+	}
+	err = rr.Close()
+	require.NoError(t, err)
+
+	require.True(t, pgConn.TxStatus() == 'T')
+
+	rr = pgConn.Exec(ctx, `select 'Hello, world'`)
+	for rr.NextResult() {
+	}
+	err = rr.Close()
+	require.NoError(t, err)
+
+	pgConn.SetCleanupWithoutReset(true)
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond*100)
+	defer cancel()
+
+	err = pgConn.Cleanup(ctx)
+	require.NoError(t, err)
+
+	require.True(t, pgConn.TxStatus() == 'I')
+	require.True(t, pgConn.IsIdle())
+}
+
+func TestCleanupWithNoTransaction(t *testing.T) {
+	t.Parallel()
+
+	pgConn, err := pgconn.Connect(context.Background(), os.Getenv("PGX_TEST_CONN_STRING"))
+	require.NoError(t, err)
+
+	defer closeConn(t, pgConn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rr := pgConn.Exec(ctx, `select 'Hello, world'`)
+
+	require.True(t, pgConn.TxStatus() == 'I')
+	for rr.NextResult() {
+		require.True(t, pgConn.TxStatus() == 'I')
 	}
 
-	for _, row := range result.Rows {
-		fmt.Println(string(row[0]))
-	}
+	err = rr.Close()
+	require.NoError(t, err)
 
-	fmt.Println(result.CommandTag)
-	// Output:
-	// 1
-	// 2
-	// 3
-	// SELECT 3
+	pgConn.SetCleanupWithoutReset(true)
+
+	ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond*100)
+	defer cancel()
+
+	require.True(t, pgConn.TxStatus() == 'I')
+
+	err = pgConn.Cleanup(ctx)
+	require.NoError(t, err)
+
+	require.True(t, pgConn.TxStatus() == 'I')
+	require.True(t, pgConn.IsIdle())
 }

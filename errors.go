@@ -76,6 +76,8 @@ func (e *connectError) Unwrap() error {
 	return e.err
 }
 
+var ErrLockCleanupConn = &connLockError{status: "conn need to cleanup"}
+
 type connLockError struct {
 	status string
 }
@@ -157,25 +159,25 @@ func (e *errTimeout) Unwrap() error {
 	return e.err
 }
 
-type contextAlreadyDoneError struct {
+type СontextAlreadyDoneError struct {
 	err error
 }
 
-func (e *contextAlreadyDoneError) Error() string {
+func (e *СontextAlreadyDoneError) Error() string {
 	return fmt.Sprintf("context already done: %s", e.err.Error())
 }
 
-func (e *contextAlreadyDoneError) SafeToRetry() bool {
+func (e *СontextAlreadyDoneError) SafeToRetry() bool {
 	return true
 }
 
-func (e *contextAlreadyDoneError) Unwrap() error {
+func (e *СontextAlreadyDoneError) Unwrap() error {
 	return e.err
 }
 
-// newContextAlreadyDoneError double-wraps a context error in `contextAlreadyDoneError` and `errTimeout`.
+// newContextAlreadyDoneError double-wraps a context error in `СontextAlreadyDoneError` and `errTimeout`.
 func newContextAlreadyDoneError(ctx context.Context) (err error) {
-	return &errTimeout{&contextAlreadyDoneError{err: ctx.Err()}}
+	return &errTimeout{&СontextAlreadyDoneError{err: ctx.Err()}}
 }
 
 type writeError struct {
